@@ -19,11 +19,15 @@ macro_rules! t {
 fn main() {
     let https = env::var("CARGO_FEATURE_HTTPS").is_ok();
     let ssh = env::var("CARGO_FEATURE_SSH").is_ok();
+    let curl = env::var("CARGO_FEATURE_CURL").is_ok();
     if ssh {
         register_dep("SSH2");
     }
     if https {
         register_dep("OPENSSL");
+    }
+    if curl {
+        register_dep("CURL");
     }
     let has_pkgconfig = Command::new("pkg-config").output().is_ok();
 
@@ -31,6 +35,11 @@ fn main() {
         if pkg_config::find_library("libgit2").is_ok() {
             return
         }
+    }
+
+    if !Path::new("libgit2/.git").exists() {
+        let _ = Command::new("git").args(&["submodule", "update", "--init"])
+                                   .status();
     }
 
     let target = env::var("TARGET").unwrap();
@@ -48,7 +57,13 @@ fn main() {
 
         // Currently liblibc links to msvcrt which apparently is a dynamic CRT,
         // so we need to turn this off to get it to link right.
-        cfg.define("STATIC_CRT", "OFF");
+        let features = env::var("CARGO_CFG_TARGET_FEATURE")
+                          .unwrap_or(String::new());
+        if features.contains("crt-static") {
+            cfg.define("STATIC_CRT", "ON");
+        } else {
+            cfg.define("STATIC_CRT", "OFF");
+        }
     }
 
     // libgit2 uses pkg-config to discover libssh2, but this doesn't work on
@@ -96,13 +111,17 @@ fn main() {
     } else {
         cfg.define("USE_OPENSSL", "OFF");
     }
+    if curl {
+        cfg.register_dep("CURL");
+    } else {
+        cfg.define("CURL", "OFF");
+    }
 
     let _ = fs::remove_dir_all(env::var("OUT_DIR").unwrap());
     t!(fs::create_dir_all(env::var("OUT_DIR").unwrap()));
 
     let dst = cfg.define("BUILD_SHARED_LIBS", "OFF")
                  .define("BUILD_CLAR", "OFF")
-                 .define("CURL", "OFF")
                  .register_dep("Z")
                  .build();
 
@@ -115,16 +134,6 @@ fn main() {
         if !contents.contains("-DGIT_SSH") {
             panic!("libgit2 failed to find libssh2, and SSH support is required");
         }
-    }
-
-    if target.contains("windows") {
-        println!("cargo:rustc-link-lib=winhttp");
-        println!("cargo:rustc-link-lib=rpcrt4");
-        println!("cargo:rustc-link-lib=ole32");
-        println!("cargo:rustc-link-lib=crypt32");
-        println!("cargo:rustc-link-lib=static=git2");
-        println!("cargo:rustc-link-search=native={}/lib", dst.display());
-        return
     }
 
     // libgit2 requires the http_parser library for the HTTP transport to be
@@ -144,6 +153,16 @@ fn main() {
         }
     }
 
+    if target.contains("windows") {
+        println!("cargo:rustc-link-lib=winhttp");
+        println!("cargo:rustc-link-lib=rpcrt4");
+        println!("cargo:rustc-link-lib=ole32");
+        println!("cargo:rustc-link-lib=crypt32");
+        println!("cargo:rustc-link-lib=static=git2");
+        println!("cargo:rustc-link-search=native={}/lib", dst.display());
+        return
+    }
+
     println!("cargo:rustc-link-lib=static=git2");
     println!("cargo:rustc-link-search=native={}", dst.join("lib").display());
     if target.contains("apple") {
@@ -154,11 +173,18 @@ fn main() {
 }
 
 fn register_dep(dep: &str) {
-    match env::var(&format!("DEP_{}_ROOT", dep)) {
-        Ok(s) => {
-            prepend("PKG_CONFIG_PATH", Path::new(&s).join("lib/pkgconfig"));
+    if let Some(s) = env::var_os(&format!("DEP_{}_ROOT", dep)) {
+        prepend("PKG_CONFIG_PATH", Path::new(&s).join("lib/pkgconfig"));
+        return
+    }
+    if let Some(s) = env::var_os(&format!("DEP_{}_INCLUDE", dep)) {
+        let root = Path::new(&s).parent().unwrap();
+        env::set_var(&format!("DEP_{}_ROOT", dep), root);
+        let path = root.join("lib/pkgconfig");
+        if path.exists() {
+            prepend("PKG_CONFIG_PATH", path);
+            return
         }
-        Err(..) => {}
     }
 }
 

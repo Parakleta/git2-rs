@@ -4,8 +4,10 @@
 extern crate libc;
 #[cfg(feature = "ssh")]
 extern crate libssh2_sys as libssh2;
+#[cfg(feature = "curl")]
+extern crate curl_sys;
 #[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), feature = "https"))]
-extern crate openssl_sys as openssl;
+extern crate openssl_sys;
 extern crate libz_sys as libz;
 
 use libc::{c_int, c_char, c_uint, size_t, c_uchar, c_void};
@@ -13,11 +15,13 @@ use libc::{c_int, c_char, c_uint, size_t, c_uchar, c_void};
 pub const GIT_OID_RAWSZ: usize = 20;
 pub const GIT_OID_HEXSZ: usize = GIT_OID_RAWSZ * 2;
 pub const GIT_CLONE_OPTIONS_VERSION: c_uint = 1;
+pub const GIT_STASH_APPLY_OPTIONS_VERSION: c_uint = 1;
 pub const GIT_CHECKOUT_OPTIONS_VERSION: c_uint = 1;
 pub const GIT_MERGE_OPTIONS_VERSION: c_uint = 1;
 pub const GIT_REMOTE_CALLBACKS_VERSION: c_uint = 1;
 pub const GIT_STATUS_OPTIONS_VERSION: c_uint = 1;
 pub const GIT_BLAME_OPTIONS_VERSION: c_uint = 1;
+pub const GIT_PROXY_OPTIONS_VERSION: c_uint = 1;
 
 macro_rules! git_enum {
     (pub enum $name:ident { $($variants:tt)* }) => {
@@ -70,9 +74,11 @@ pub enum git_pathspec {}
 pub enum git_pathspec_match_list {}
 pub enum git_diff {}
 pub enum git_diff_stats {}
+pub enum git_patch {}
 pub enum git_reflog {}
 pub enum git_reflog_entry {}
 pub enum git_describe_result {}
+pub enum git_packbuilder {}
 
 #[repr(C)]
 pub struct git_revspec {
@@ -328,6 +334,7 @@ pub struct git_fetch_options {
     pub prune: git_fetch_prune_t,
     pub update_fetchhead: c_int,
     pub download_tags: git_remote_autotag_option_t,
+    pub proxy_opts: git_proxy_options,
     pub custom_headers: git_strarray,
 }
 
@@ -363,8 +370,8 @@ pub type git_cred_acquire_cb = extern fn(*mut *mut git_cred,
                                          c_uint, *mut c_void) -> c_int;
 pub type git_transfer_progress_cb = extern fn(*const git_transfer_progress,
                                               *mut c_void) -> c_int;
-pub type git_packbuilder_progress = extern fn(c_int, c_uint, c_uint,
-                                              *mut c_void) -> c_int;
+pub type git_packbuilder_progress = extern fn(git_packbuilder_stage_t, c_uint,
+                                              c_uint, *mut c_void) -> c_int;
 pub type git_push_transfer_progress = extern fn(c_uint, c_uint, size_t,
                                                 *mut c_void) -> c_int;
 pub type git_transport_certificate_check_cb = extern fn(*mut git_cert,
@@ -536,7 +543,6 @@ pub struct git_status_options {
     pub flags: c_uint,
     pub pathspec: git_strarray,
 }
-pub use git_status_show_t::*;
 
 #[repr(C)]
 pub struct git_diff_delta {
@@ -560,6 +566,7 @@ git_enum! {
         GIT_CHECKOUT_NONE = 0,
         GIT_CHECKOUT_SAFE = (1 << 0),
         GIT_CHECKOUT_FORCE = (1 << 1),
+        GIT_CHECKOUT_RECREATE_MISSING = (1 << 2),
         GIT_CHECKOUT_ALLOW_CONFLICTS = (1 << 4),
         GIT_CHECKOUT_REMOVE_UNTRACKED = (1 << 5),
         GIT_CHECKOUT_REMOVE_IGNORED = (1 << 6),
@@ -635,6 +642,8 @@ pub type git_treewalk_cb = extern fn(*const c_char, *const git_tree_entry,
 pub type git_treebuilder_filter_cb = extern fn(*const git_tree_entry,
                                                *mut c_void) -> c_int;
 
+pub type git_revwalk_hide_cb = extern fn(*const git_oid, *mut c_void) -> c_int;
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct git_buf {
@@ -688,6 +697,34 @@ pub struct git_blame_hunk {
 pub type git_index_matched_path_cb = extern fn(*const c_char, *const c_char,
                                                *mut c_void) -> c_int;
 
+git_enum! {
+    pub enum git_idxentry_extended_flag_t {
+        GIT_IDXENTRY_INTENT_TO_ADD     = 1 << 13,
+        GIT_IDXENTRY_SKIP_WORKTREE     = 1 << 14,
+        GIT_IDXENTRY_EXTENDED2         = 1 << 15,
+
+        GIT_IDXENTRY_UPDATE            = 1 << 0,
+        GIT_IDXENTRY_REMOVE            = 1 << 1,
+        GIT_IDXENTRY_UPTODATE          = 1 << 2,
+        GIT_IDXENTRY_ADDED             = 1 << 3,
+
+        GIT_IDXENTRY_HASHED            = 1 << 4,
+        GIT_IDXENTRY_UNHASHED          = 1 << 5,
+        GIT_IDXENTRY_WT_REMOVE         = 1 << 6,
+        GIT_IDXENTRY_CONFLICTED        = 1 << 7,
+
+        GIT_IDXENTRY_UNPACKED          = 1 << 8,
+        GIT_IDXENTRY_NEW_SKIP_WORKTREE = 1 << 9,
+    }
+}
+
+git_enum! {
+    pub enum git_indxentry_flag_t {
+        GIT_IDXENTRY_EXTENDED = 0x4000,
+        GIT_IDXENTRY_VALID    = 0x8000,
+    }
+}
+
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct git_index_entry {
@@ -704,6 +741,10 @@ pub struct git_index_entry {
     pub flags_extended: u16,
     pub path: *const c_char,
 }
+
+pub const GIT_IDXENTRY_NAMEMASK: u16 = 0xfff;
+pub const GIT_IDXENTRY_STAGEMASK: u16 = 0x3000;
+pub const GIT_IDXENTRY_STAGESHIFT: u16 = 12;
 
 #[repr(C)]
 #[derive(Copy, Clone, Eq, PartialEq)]
@@ -805,6 +846,7 @@ pub struct git_push_options {
     pub version: c_uint,
     pub pb_parallelism: c_uint,
     pub callbacks: git_remote_callbacks,
+    pub proxy_opts: git_proxy_options,
     pub custom_headers: git_strarray,
 }
 
@@ -818,6 +860,16 @@ git_enum! {
         GIT_INDEX_ADD_FORCE = 1 << 0,
         GIT_INDEX_ADD_DISABLE_PATHSPEC_MATCH = 1 << 1,
         GIT_INDEX_ADD_CHECK_PATHSPEC = 1 << 2,
+    }
+}
+
+git_enum! {
+    pub enum git_repository_open_flag_t {
+        GIT_REPOSITORY_OPEN_NO_SEARCH = (1 << 0),
+        GIT_REPOSITORY_OPEN_CROSS_FS = (1 << 1),
+        GIT_REPOSITORY_OPEN_BARE = (1 << 2),
+        GIT_REPOSITORY_OPEN_NO_DOTGIT = (1 << 3),
+        GIT_REPOSITORY_OPEN_FROM_ENV = (1 << 4),
     }
 }
 
@@ -1078,6 +1130,7 @@ pub const GIT_DIFF_FIND_REMOVE_UNMODIFIED: u32 = 1 << 16;
 
 #[repr(C)]
 pub struct git_diff_binary {
+    pub contains_data: c_uint,
     pub old_file: git_diff_binary_file,
     pub new_file: git_diff_binary_file,
 }
@@ -1106,6 +1159,7 @@ pub struct git_merge_options {
     pub target_limit: c_uint,
     pub metric: *mut git_diff_similarity_metric,
     pub recursion_limit: c_uint,
+    pub default_driver: *const c_char,
     pub file_favor: git_merge_file_favor_t,
     pub file_flags: git_merge_file_flag_t,
 }
@@ -1160,6 +1214,7 @@ pub struct git_transport {
                            *const c_char,
                            git_cred_acquire_cb,
                            *mut c_void,
+                           *const git_proxy_options,
                            c_int, c_int) -> c_int,
     pub ls: extern fn(*mut *mut *const git_remote_head,
                       *mut size_t,
@@ -1181,6 +1236,24 @@ pub struct git_transport {
     pub cancel: extern fn(*mut git_transport),
     pub close: extern fn(*mut git_transport) -> c_int,
     pub free: extern fn(*mut git_transport),
+}
+
+#[repr(C)]
+pub struct git_proxy_options {
+    pub version: c_uint,
+    pub kind: git_proxy_t,
+    pub url: *const c_char,
+    pub credentials: Option<git_cred_acquire_cb>,
+    pub certificate_check: Option<git_transport_certificate_check_cb>,
+    pub payload: *mut c_void,
+}
+
+git_enum! {
+    pub enum git_proxy_t {
+        GIT_PROXY_NONE = 0,
+        GIT_PROXY_AUTO = 1,
+        GIT_PROXY_SPECIFIED = 2,
+    }
 }
 
 git_enum! {
@@ -1252,127 +1325,61 @@ pub struct git_describe_format_options {
     pub dirty_suffix: *const c_char,
 }
 
-/// Initialize openssl for the libgit2 library
-#[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), feature = "https"))]
-pub fn openssl_init() {
-    if !cfg!(target_os = "linux") && !cfg!(target_os = "freebsd") { return }
-
-    // Currently, libgit2 leverages OpenSSL for SSL support when cloning
-    // repositories over HTTPS. This means that we're picking up an OpenSSL
-    // dependency on non-Windows platforms (where it has its own HTTPS
-    // subsystem). As a result, we need to link to OpenSSL.
-    //
-    // Now actually *linking* to OpenSSL isn't so hard. We just need to make
-    // sure to use pkg-config to discover any relevant system dependencies for
-    // differences between distributions like CentOS and Ubuntu. The actual
-    // trickiness comes about when we start *distributing* the resulting
-    // binaries. Currently Cargo is distributed in binary form as nightlies,
-    // which means we're distributing a binary with OpenSSL linked in.
-    //
-    // For historical reasons, the Linux nightly builder is running a CentOS
-    // distribution in order to have as much ABI compatibility with other
-    // distributions as possible. Sadly, however, this compatibility does not
-    // extend to OpenSSL. Currently OpenSSL has two major versions, 0.9 and 1.0,
-    // which are incompatible (many ABI differences). The CentOS builder we
-    // build on has version 1.0, as do most distributions today. Some still have
-    // 0.9, however. This means that if we are to distribute the binaries built
-    // by the CentOS machine, we would only be compatible with OpenSSL 1.0 and
-    // we would fail to run (a dynamic linker error at runtime) on systems with
-    // only 9.8 installed (hopefully).
-    //
-    // But wait, the plot thickens! Apparently CentOS has dubbed their OpenSSL
-    // library as `libssl.so.10`, notably the `10` is included at the end. On
-    // the other hand Ubuntu, for example, only distributes `libssl.so`. This
-    // means that the binaries created at CentOS are hard-wired to probe for a
-    // file called `libssl.so.10` at runtime (using the LD_LIBRARY_PATH), which
-    // will not be found on ubuntu. The conclusion of this is that binaries
-    // built on CentOS cannot be distributed to Ubuntu and run successfully.
-    //
-    // There are a number of sneaky things we could do, including, but not
-    // limited to:
-    //
-    // 1. Create a shim program which runs "just before" cargo runs. The
-    //    responsibility of this shim program would be to locate `libssl.so`,
-    //    whatever it's called, on the current system, make sure there's a
-    //    symlink *somewhere* called `libssl.so.10`, and then set up
-    //    LD_LIBRARY_PATH and run the actual cargo.
-    //
-    //    This approach definitely seems unconventional, and is borderline
-    //    overkill for this problem. It's also dubious if we can find a
-    //    libssl.so reliably on the target system.
-    //
-    // 2. Somehow re-work the CentOS installation so that the linked-against
-    //    library is called libssl.so instead of libssl.so.10
-    //
-    //    The problem with this approach is that systems with 0.9 installed will
-    //    start to silently fail, due to also having libraries called libssl.so
-    //    (probably symlinked under a more appropriate version).
-    //
-    // 3. Compile Cargo against both OpenSSL 1.0 *and* OpenSSL 0.9, and
-    //    distribute both. Also make sure that the linked-against name of the
-    //    library is `libssl.so`. At runtime we determine which version is
-    //    installed, and we then the appropriate binary.
-    //
-    //    This approach clearly has drawbacks in terms of infrastructure and
-    //    feasibility.
-    //
-    // 4. Build a nightly of Cargo for each distribution we'd like to support.
-    //    You would then pick the appropriate Cargo nightly to install locally.
-    //
-    // So, with all this in mind, the decision was made to *statically* link
-    // OpenSSL. This solves any problem of relying on a downstream OpenSSL
-    // version being available. This does, however, open a can of worms related
-    // to security issues. It's generally a good idea to dynamically link
-    // OpenSSL as you'll get security updates over time without having to do
-    // anything (the system administrator will update the local openssl
-    // package). By statically linking, we're forfeiting this feature.
-    //
-    // The conclusion was made it is likely appropriate for the Cargo nightlies
-    // to statically link OpenSSL, but highly encourage distributions and
-    // packagers of Cargo to dynamically link OpenSSL. Packagers are targeting
-    // one system and are distributing to only that system, so none of the
-    // problems mentioned above would arise.
-    //
-    // In order to support this, a new package was made: openssl-static-sys.
-    // This package currently performs a fairly simple task:
-    //
-    // 1. Run pkg-config to discover where openssl is installed.
-    // 2. If openssl is installed in a nonstandard location, *and* static copies
-    //    of the libraries are available, copy them to $OUT_DIR.
-    //
-    // This library will bring in libssl.a and libcrypto.a into the local build,
-    // allowing them to be picked up by this crate. This allows us to configure
-    // our own buildbots to have pkg-config point to these local pre-built
-    // copies of a static OpenSSL (with very few dependencies) while allowing
-    // most other builds of Cargo to naturally dynamically link OpenSSL.
-    //
-    // So in summary, if you're with me so far, we've statically linked OpenSSL
-    // to the Cargo binary (or any binary, for that matter) and we're ready to
-    // distribute it to *all* linux distributions. Remember that our original
-    // intent for openssl was for HTTPS support, which implies that we need some
-    // for of CA certificate store to validate certificates. This is normally
-    // installed in a standard system location.
-    //
-    // Unfortunately, as one might imagine, OpenSSL is configured for where this
-    // standard location is at *build time*, but it often varies widely
-    // per-system. Consequently, it was discovered that OpenSSL will respect the
-    // SSL_CERT_FILE and SSL_CERT_DIR environment variables in order to assist
-    // in discovering the location of this file (hurray!).
-    //
-    // So, finally getting to the point, this function solely exists to support
-    // our static builds of OpenSSL by probing for the "standard system
-    // location" of certificates and setting relevant environment variable to
-    // point to them.
-    //
-    // Ah, and as a final note, this is only a problem on Linux, not on OS X. On
-    // OS X the OpenSSL binaries are stable enough that we can just rely on
-    // dynamic linkage (plus they have some weird modifications to OpenSSL which
-    // means we wouldn't want to link statically).
-    openssl::probe::init_ssl_cert_env_vars();
+git_enum! {
+    pub enum git_packbuilder_stage_t {
+        GIT_PACKBUILDER_ADDING_OBJECTS,
+        GIT_PACKBUILDER_DELTAFICATION,
+    }
 }
 
-#[cfg(any(windows, target_os = "macos", target_os = "ios", not(feature = "https")))]
-pub fn openssl_init() {}
+git_enum! {
+    pub enum git_stash_flags {
+        GIT_STASH_DEFAULT = 0,
+        GIT_STASH_KEEP_INDEX = 1 << 0,
+        GIT_STASH_INCLUDE_UNTRACKED = 1 << 1,
+        GIT_STASH_INCLUDE_IGNORED = 1 << 2,
+    }
+}
+
+git_enum! {
+    pub enum git_stash_apply_flags {
+        GIT_STASH_APPLY_DEFAULT = 0,
+        GIT_STASH_APPLY_REINSTATE_INDEX = 1 << 0,
+    }
+}
+
+git_enum! {
+    pub enum git_stash_apply_progress_t {
+        GIT_STASH_APPLY_PROGRESS_NONE = 0,
+        GIT_STASH_APPLY_PROGRESS_LOADING_STASH,
+        GIT_STASH_APPLY_PROGRESS_ANALYZE_INDEX,
+        GIT_STASH_APPLY_PROGRESS_ANALYZE_MODIFIED,
+        GIT_STASH_APPLY_PROGRESS_ANALYZE_UNTRACKED,
+        GIT_STASH_APPLY_PROGRESS_CHECKOUT_UNTRACKED,
+        GIT_STASH_APPLY_PROGRESS_CHECKOUT_MODIFIED,
+        GIT_STASH_APPLY_PROGRESS_DONE,
+    }
+}
+
+#[repr(C)]
+pub struct git_stash_apply_options {
+    pub version: c_uint,
+    pub flags: git_stash_apply_flags,
+    pub checkout_options: git_checkout_options,
+    pub progress_cb: git_stash_apply_progress_cb,
+    pub progress_payload: *mut c_void,
+}
+
+pub type git_stash_apply_progress_cb = extern fn(progress: git_stash_apply_progress_t,
+                                                 payload: *mut c_void) -> c_int;
+
+pub type git_stash_cb = extern fn(index: size_t,
+                                  message: *const c_char,
+                                  stash_id: *const git_oid,
+                                  payload: *mut c_void) -> c_int;
+
+pub type git_packbuilder_foreach_cb = extern fn(*const c_void, size_t,
+                                                *mut c_void) -> c_int;
 
 extern {
     // threads
@@ -1383,6 +1390,10 @@ extern {
     pub fn git_repository_free(repo: *mut git_repository);
     pub fn git_repository_open(repo: *mut *mut git_repository,
                                path: *const c_char) -> c_int;
+    pub fn git_repository_open_ext(repo: *mut *mut git_repository,
+                                   path: *const c_char,
+                                   flags: c_uint,
+                                   ceiling_dirs: *const c_char) -> c_int;
     pub fn git_repository_init(repo: *mut *mut git_repository,
                                path: *const c_char,
                                is_bare: c_uint) -> c_int;
@@ -1406,8 +1417,13 @@ extern {
     pub fn git_repository_path(repo: *mut git_repository) -> *const c_char;
     pub fn git_repository_state(repo: *mut git_repository) -> c_int;
     pub fn git_repository_workdir(repo: *mut git_repository) -> *const c_char;
+    pub fn git_repository_set_workdir(repo: *mut git_repository,
+                                      workdir: *const c_char,
+                                      update_gitlink: c_int) -> c_int;
     pub fn git_repository_index(out: *mut *mut git_index,
                                 repo: *mut git_repository) -> c_int;
+    pub fn git_repository_set_index(repo: *mut git_repository,
+                                    index: *mut git_index);
     pub fn git_repository_config(out: *mut *mut git_config,
                                  repo: *mut git_repository) -> c_int;
     pub fn git_repository_config_snapshot(out: *mut *mut git_config,
@@ -1485,6 +1501,7 @@ extern {
     pub fn git_remote_connect(remote: *mut git_remote,
                               dir: git_direction,
                               callbacks: *const git_remote_callbacks,
+                              proxy_opts: *const git_proxy_options,
                               custom_headers: *const git_strarray) -> c_int;
     pub fn git_remote_connected(remote: *const git_remote) -> c_int;
     pub fn git_remote_disconnect(remote: *mut git_remote);
@@ -1668,6 +1685,50 @@ extern {
                                          target: *const c_char,
                                          force: c_int,
                                          log_message: *const c_char) -> c_int;
+    pub fn git_reference_create_matching(out: *mut *mut git_reference,
+                                         repo: *mut git_repository,
+                                         name: *const c_char,
+                                         id: *const git_oid,
+                                         force: c_int,
+                                         current_id: *const git_oid,
+                                         log_message: *const c_char) -> c_int;
+    pub fn git_reference_symbolic_create_matching(out: *mut *mut git_reference,
+                                                  repo: *mut git_repository,
+                                                  name: *const c_char,
+                                                  target: *const c_char,
+                                                  force: c_int,
+                                                  current_id: *const c_char,
+                                                  log_message: *const c_char)
+                                                  -> c_int;
+    pub fn git_reference_has_log(repo: *mut git_repository,
+                                 name: *const c_char) -> c_int;
+    pub fn git_reference_ensure_log(repo: *mut git_repository,
+                                    name: *const c_char) -> c_int;
+
+    // stash
+    pub fn git_stash_save(out: *mut git_oid,
+                          repo: *mut git_repository,
+                          stasher: *const git_signature,
+                          message: *const c_char,
+                          flags: c_uint) -> c_int;
+
+    pub fn git_stash_apply_init_options(opts: *mut git_stash_apply_options,
+                                        version: c_uint) -> c_int;
+
+    pub fn git_stash_apply(repo: *mut git_repository,
+                           index: size_t,
+                           options: *const git_stash_apply_options) -> c_int;
+
+    pub fn git_stash_foreach(repo: *mut git_repository,
+                             callback: git_stash_cb,
+                             payload: *mut c_void) -> c_int;
+
+    pub fn git_stash_drop(repo: *mut git_repository,
+                          index: size_t) -> c_int;
+
+    pub fn git_stash_pop(repo: *mut git_repository,
+                         index: size_t,
+                         options: *const git_stash_apply_options) -> c_int;
 
     // submodules
     pub fn git_submodule_add_finalize(submodule: *mut git_submodule) -> c_int;
@@ -2018,6 +2079,10 @@ extern {
     pub fn git_config_set_int64(cfg: *mut git_config,
                                 name: *const c_char,
                                 value: i64) -> c_int;
+    pub fn git_config_set_multivar(cfg: *mut git_config,
+                                   name: *const c_char,
+                                   regexp: *const c_char,
+                                   value: *const c_char) -> c_int;
     pub fn git_config_set_string(cfg: *mut git_config,
                                  name: *const c_char,
                                  value: *const c_char) -> c_int;
@@ -2223,6 +2288,9 @@ extern {
                                 refname: *const c_char) -> c_int;
     pub fn git_revwalk_hide_glob(walk: *mut git_revwalk,
                                  refname: *const c_char) -> c_int;
+    pub fn git_revwalk_add_hide_cb(walk: *mut git_revwalk,
+                                   hide_cb: git_revwalk_hide_cb,
+                                   payload: *mut c_void) -> c_int;
 
     pub fn git_revwalk_next(out: *mut git_oid, walk: *mut git_revwalk) -> c_int;
 
@@ -2321,6 +2389,11 @@ extern {
                               idx: size_t) -> *const git_diff_delta;
     pub fn git_diff_get_stats(out: *mut *mut git_diff_stats,
                               diff: *mut git_diff) -> c_int;
+    pub fn git_diff_index_to_index(diff: *mut *mut git_diff,
+                                   repo: *mut git_repository,
+                                   old_index: *mut git_index,
+                                   new_index: *mut git_index,
+                                   opts: *const git_diff_options) -> c_int;
     pub fn git_diff_index_to_workdir(diff: *mut *mut git_diff,
                                      repo: *mut git_repository,
                                      index: *mut git_index,
@@ -2375,6 +2448,58 @@ extern {
                                    commit: *const git_oid, ancestor: *const git_oid)
                                    -> c_int;
 
+    // patch
+    pub fn git_patch_from_diff(out: *mut *mut git_patch,
+                               diff: *mut git_diff,
+                               idx: size_t) -> c_int;
+    pub fn git_patch_from_blobs(out: *mut *mut git_patch,
+                                old_blob: *const git_blob,
+                                old_as_path: *const c_char,
+                                new_blob: *const git_blob,
+                                new_as_path: *const c_char,
+                                opts: *const git_diff_options) -> c_int;
+    pub fn git_patch_from_blob_and_buffer(out: *mut *mut git_patch,
+                                          old_blob: *const git_blob,
+                                          old_as_path: *const c_char,
+                                          buffer: *const c_char,
+                                          buffer_len: size_t,
+                                          buffer_as_path: *const c_char,
+                                          opts: *const git_diff_options) -> c_int;
+    pub fn git_patch_from_buffers(out: *mut *mut git_patch,
+                                  old_buffer: *const c_void,
+                                  old_len: size_t,
+                                  old_as_path: *const c_char,
+                                  new_buffer: *const c_char,
+                                  new_len: size_t,
+                                  new_as_path: *const c_char,
+                                  opts: *const git_diff_options) -> c_int;
+    pub fn git_patch_free(patch: *mut git_patch);
+    pub fn git_patch_get_delta(patch: *const git_patch) -> *const git_diff_delta;
+    pub fn git_patch_num_hunks(patch: *const git_patch) -> size_t;
+    pub fn git_patch_line_stats(total_context: *mut size_t,
+                                total_additions: *mut size_t,
+                                total_deletions: *mut size_t,
+                                patch: *const git_patch) -> c_int;
+    pub fn git_patch_get_hunk(out: *mut *const git_diff_hunk,
+                              lines_in_hunk: *mut size_t,
+                              patch: *mut git_patch,
+                              hunk_idx: size_t) -> c_int;
+    pub fn git_patch_num_lines_in_hunk(patch: *const git_patch,
+                                       hunk_idx: size_t) -> c_int;
+    pub fn git_patch_get_line_in_hunk(out: *mut *const git_diff_line,
+                                      patch: *mut git_patch,
+                                      hunk_idx: size_t,
+                                      line_of_hunk: size_t) -> c_int;
+    pub fn git_patch_size(patch: *mut git_patch,
+                          include_context: c_int,
+                          include_hunk_headers: c_int,
+                          include_file_headers: c_int) -> size_t;
+    pub fn git_patch_print(patch: *mut git_patch,
+                           print_cb: git_diff_line_cb,
+                           payload: *mut c_void) -> c_int;
+    pub fn git_patch_to_buf(buf: *mut git_buf,
+                            patch: *mut git_patch) -> c_int;
+
     // reflog
     pub fn git_reflog_append(reflog: *mut git_reflog,
                              id: *const git_oid,
@@ -2425,9 +2550,80 @@ extern {
     pub fn git_describe_workdir(out: *mut *mut git_describe_result,
                                 repo: *mut git_repository,
                                 opts: *mut git_describe_options) -> c_int;
+
+    // message
+    pub fn git_message_prettify(out: *mut git_buf,
+                                message: *const c_char,
+                                strip_comments: c_int,
+                                comment_char: c_char) -> c_int;
+
+    // packbuilder
+    pub fn git_packbuilder_new(out: *mut *mut git_packbuilder,
+                               repo: *mut git_repository) -> c_int;
+    pub fn git_packbuilder_set_threads(pb: *mut git_packbuilder,
+                                       n: c_uint) -> c_uint;
+    pub fn git_packbuilder_insert(pb: *mut git_packbuilder,
+                                  id: *const git_oid,
+                                  name: *const c_char) -> c_int;
+    pub fn git_packbuilder_insert_tree(pb: *mut git_packbuilder,
+                                       id: *const git_oid) -> c_int;
+    pub fn git_packbuilder_insert_commit(pb: *mut git_packbuilder,
+                                         id: *const git_oid) -> c_int;
+    pub fn git_packbuilder_insert_walk(pb: *mut git_packbuilder,
+                                       walk: *mut git_revwalk) -> c_int;
+    pub fn git_packbuilder_insert_recur(pb: *mut git_packbuilder,
+                                        id: *const git_oid,
+                                        name: *const c_char) -> c_int;
+    pub fn git_packbuilder_write_buf(buf: *mut git_buf,
+                                     pb: *mut git_packbuilder) -> c_int;
+    pub fn git_packbuilder_write(pb: *mut git_packbuilder,
+                                 path: *const c_char,
+                                 mode: c_uint,
+                                 progress_cb: Option<git_transfer_progress_cb>,
+                                 progress_cb_payload: *mut c_void) -> c_int;
+    pub fn git_packbuilder_hash(pb: *mut git_packbuilder) -> *const git_oid;
+    pub fn git_packbuilder_foreach(pb: *mut git_packbuilder,
+                                   cb: git_packbuilder_foreach_cb,
+                                   payload: *mut c_void) -> c_int;
+    pub fn git_packbuilder_object_count(pb: *mut git_packbuilder) -> size_t;
+    pub fn git_packbuilder_written(pb: *mut git_packbuilder) -> size_t;
+    pub fn git_packbuilder_set_callbacks(pb: *mut git_packbuilder,
+                                         progress_cb: Option<git_packbuilder_progress>,
+                                         progress_cb_payload: *mut c_void) -> c_int;
+    pub fn git_packbuilder_free(pb: *mut git_packbuilder);
 }
 
-#[test]
-fn smoke() {
-    unsafe { git_threads_init(); }
+pub fn init() {
+    use std::sync::{Once, ONCE_INIT};
+
+    static INIT: Once = ONCE_INIT;
+    INIT.call_once(|| unsafe {
+        openssl_init();
+        ssh_init();
+        let r = git_libgit2_init();
+        assert!(r >= 0,
+                "couldn't initialize the libgit2 library: {}", r);
+        assert_eq!(libc::atexit(shutdown), 0);
+    });
+    extern fn shutdown() {
+        unsafe { git_libgit2_shutdown(); }
+    }
 }
+
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), feature = "https"))]
+#[doc(hidden)]
+pub fn openssl_init() {
+    openssl_sys::init();
+}
+
+#[cfg(any(windows, target_os = "macos", target_os = "ios", not(feature = "https")))]
+#[doc(hidden)]
+pub fn openssl_init() {}
+
+#[cfg(feature = "ssh")]
+fn ssh_init() {
+    libssh2::init();
+}
+
+#[cfg(not(feature = "ssh"))]
+fn ssh_init() {}

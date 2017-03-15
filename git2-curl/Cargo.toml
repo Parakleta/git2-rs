@@ -1,12 +1,12 @@
 [package]
 
 name = "git2-curl"
-version = "0.4.0"
+version = "0.7.0"
 authors = ["Alex Crichton <alex@alexcrichton.com>"]
 license = "MIT/Apache-2.0"
 repository = "https://github.com/alexcrichton/git2-rs"
 homepage = "https://github.com/alexcrichton/git2-rs"
-documentation = "http://alexcrichton.com/git2-rs/git2-curl"
+documentation = "https://docs.rs/git2-curl"
 description = """
 Backend for an HTTP transport in libgit2 powered by libcurl.
 
@@ -14,10 +14,10 @@ Intended to be used with the git2 crate.
 """
 
 [dependencies]
-curl = "0.2"
-url = "0.5"
+curl = "0.4"
+url = "1.0"
 log = "0.3"
-git2 = { path = "..", version = "0.4" }
+git2 = { path = "..", version = "0.6", default-features = false }
 
 [dev-dependencies]
 civet = "0.8"

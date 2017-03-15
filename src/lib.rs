@@ -63,11 +63,10 @@
 //! source `Repository`, to ensure that they do not outlive the repository
 //! itself.
 
-#![doc(html_root_url = "http://alexcrichton.com/git2-rs")]
+#![doc(html_root_url = "https://docs.rs/git2/0.6")]
 #![allow(trivial_numeric_casts, trivial_casts)]
 #![deny(missing_docs)]
 #![cfg_attr(test, deny(warnings))]
-#![cfg_attr(feature = "unstable", feature(recover, std_panic))]
 
 extern crate libc;
 extern crate url;
@@ -89,20 +88,24 @@ pub use config::{Config, ConfigEntry, ConfigEntries};
 pub use cred::{Cred, CredentialHelper};
 pub use describe::{Describe, DescribeFormatOptions, DescribeOptions};
 pub use diff::{Diff, DiffDelta, DiffFile, DiffOptions, Deltas};
-pub use diff::{DiffLine, DiffHunk, DiffStats, DiffFindOptions};
 pub use diff::{DiffBinary, DiffBinaryFile, DiffBinaryKind};
-pub use merge::{AnnotatedCommit, MergeOptions};
+pub use diff::{DiffLine, DiffHunk, DiffStats, DiffFindOptions};
 pub use error::Error;
 pub use index::{Index, IndexEntry, IndexEntries, IndexMatchedPath};
+pub use merge::{AnnotatedCommit, MergeOptions};
+pub use message::{message_prettify, DEFAULT_COMMENT_CHAR};
 pub use note::{Note, Notes};
 pub use object::Object;
 pub use oid::Oid;
+pub use packbuilder::{PackBuilder, PackBuilderStage};
 pub use pathspec::{Pathspec, PathspecMatchList, PathspecFailedEntries};
 pub use pathspec::{PathspecDiffEntries, PathspecEntries};
+pub use patch::Patch;
+pub use proxy_options::ProxyOptions;
 pub use reference::{Reference, References, ReferenceNames};
 pub use reflog::{Reflog, ReflogEntry, ReflogIter};
 pub use refspec::Refspec;
-pub use remote::{Remote, Refspecs, RemoteHead, FetchOptions, PushOptions};
+pub use remote::{Remote, RemoteConnection, Refspecs, RemoteHead, FetchOptions, PushOptions};
 pub use remote_callbacks::{RemoteCallbacks, Credentials, TransferProgress};
 pub use remote_callbacks::{TransportMessage, Progress, UpdateTips};
 pub use repo::{Repository, RepositoryInitOptions};
@@ -110,6 +113,7 @@ pub use revspec::Revspec;
 pub use revwalk::Revwalk;
 pub use signature::Signature;
 pub use status::{StatusOptions, Statuses, StatusIter, StatusEntry, StatusShow};
+pub use stash::{StashApplyOptions, StashCb, StashApplyProgressCb};
 pub use submodule::Submodule;
 pub use tag::Tag;
 pub use time::{Time, IndexTime};
@@ -277,7 +281,7 @@ pub enum ResetType {
 /// An enumeration all possible kinds objects may have.
 #[derive(PartialEq, Eq, Copy, Clone, Debug)]
 pub enum ObjectType {
-    /// An object which corresponds to a any git object
+    /// Any kind of git object
     Any,
     /// An object which corresponds to a git commit
     Commit,
@@ -343,10 +347,8 @@ pub enum FileFavor {
 }
 
 bitflags! {
-    #[doc = "
-Orderings that may be specified for Revwalk iteration.
-"]
-    flags Sort: u32 {
+    /// Orderings that may be specified for Revwalk iteration.
+    pub flags Sort: u32 {
         /// Sort the repository contents in no particular ordering.
         ///
         /// This sorting is arbitrary, implementation-specific, and subject to
@@ -372,10 +374,8 @@ Orderings that may be specified for Revwalk iteration.
 }
 
 bitflags! {
-    #[doc = "
-Types of credentials that can be requested by a credential callback.
-"]
-    flags CredentialType: u32 {
+    /// Types of credentials that can be requested by a credential callback.
+    pub flags CredentialType: u32 {
         #[allow(missing_docs)]
         const USER_PASS_PLAINTEXT = raw::GIT_CREDTYPE_USERPASS_PLAINTEXT as u32,
         #[allow(missing_docs)]
@@ -394,10 +394,53 @@ Types of credentials that can be requested by a credential callback.
 }
 
 bitflags! {
-    #[doc = "
-Flags for APIs that add files matching pathspec
-"]
-    flags IndexAddOption: u32 {
+    /// Flags for the `flags` field of an IndexEntry.
+    pub flags IndexEntryFlag: u16 {
+        /// Set when the `extended_flags` field is valid.
+        const IDXENTRY_EXTENDED = raw::GIT_IDXENTRY_EXTENDED as u16,
+        /// "Assume valid" flag
+        const IDXENTRY_VALID = raw::GIT_IDXENTRY_VALID as u16,
+    }
+}
+
+bitflags! {
+    /// Flags for the `extended_flags` field of an IndexEntry.
+    pub flags IndexEntryExtendedFlag: u16 {
+        /// An "intent to add" entry from "git add -N"
+        const IDXENTRY_INTENT_TO_ADD = raw::GIT_IDXENTRY_INTENT_TO_ADD as u16,
+        /// Skip the associated worktree file, for sparse checkouts
+        const IDXENTRY_SKIP_WORKTREE = raw::GIT_IDXENTRY_SKIP_WORKTREE as u16,
+        /// Reserved for a future on-disk extended flag
+        const IDXENTRY_EXTENDED2 = raw::GIT_IDXENTRY_EXTENDED2 as u16,
+
+        #[allow(missing_docs)]
+        const IDXENTRY_UPDATE = raw::GIT_IDXENTRY_UPDATE as u16,
+        #[allow(missing_docs)]
+        const IDXENTRY_REMOVE = raw::GIT_IDXENTRY_REMOVE as u16,
+        #[allow(missing_docs)]
+        const IDXENTRY_UPTODATE = raw::GIT_IDXENTRY_UPTODATE as u16,
+        #[allow(missing_docs)]
+        const IDXENTRY_ADDED = raw::GIT_IDXENTRY_ADDED as u16,
+
+        #[allow(missing_docs)]
+        const IDXENTRY_HASHED = raw::GIT_IDXENTRY_HASHED as u16,
+        #[allow(missing_docs)]
+        const IDXENTRY_UNHASHED = raw::GIT_IDXENTRY_UNHASHED as u16,
+        #[allow(missing_docs)]
+        const IDXENTRY_WT_REMOVE = raw::GIT_IDXENTRY_WT_REMOVE as u16,
+        #[allow(missing_docs)]
+        const IDXENTRY_CONFLICTED = raw::GIT_IDXENTRY_CONFLICTED as u16,
+
+        #[allow(missing_docs)]
+        const IDXENTRY_UNPACKED = raw::GIT_IDXENTRY_UNPACKED as u16,
+        #[allow(missing_docs)]
+        const IDXENTRY_NEW_SKIP_WORKTREE = raw::GIT_IDXENTRY_NEW_SKIP_WORKTREE as u16,
+    }
+}
+
+bitflags! {
+    /// Flags for APIs that add files matching pathspec
+    pub flags IndexAddOption: u32 {
         #[allow(missing_docs)]
         const ADD_DEFAULT = raw::GIT_INDEX_ADD_DEFAULT as u32,
         #[allow(missing_docs)]
@@ -411,10 +454,24 @@ Flags for APIs that add files matching pathspec
 }
 
 bitflags! {
-    #[doc = "
-Flags for the return value of `Repository::revparse`
-"]
-    flags RevparseMode: u32 {
+    /// Flags for `Repository::open_ext`
+    pub flags RepositoryOpenFlags: u32 {
+        /// Only open the specified path; don't walk upward searching.
+        const REPOSITORY_OPEN_NO_SEARCH = raw::GIT_REPOSITORY_OPEN_NO_SEARCH as u32,
+        /// Search across filesystem boundaries.
+        const REPOSITORY_OPEN_CROSS_FS = raw::GIT_REPOSITORY_OPEN_CROSS_FS as u32,
+        /// Force opening as bare repository, and defer loading its config.
+        const REPOSITORY_OPEN_BARE = raw::GIT_REPOSITORY_OPEN_BARE as u32,
+        /// Don't try appending `/.git` to the specified repository path.
+        const REPOSITORY_OPEN_NO_DOTGIT = raw::GIT_REPOSITORY_OPEN_NO_DOTGIT as u32,
+        /// Respect environment variables like `$GIT_DIR`.
+        const REPOSITORY_OPEN_FROM_ENV = raw::GIT_REPOSITORY_OPEN_FROM_ENV as u32,
+    }
+}
+
+bitflags! {
+    /// Flags for the return value of `Repository::revparse`
+    pub flags RevparseMode: u32 {
         /// The spec targeted a single object
         const REVPARSE_SINGLE = raw::GIT_REVPARSE_SINGLE as u32,
         /// The spec targeted a range of commits
@@ -444,13 +501,17 @@ mod config;
 mod cred;
 mod describe;
 mod diff;
-mod merge;
 mod error;
 mod index;
+mod merge;
+mod message;
 mod note;
 mod object;
 mod oid;
+mod packbuilder;
 mod pathspec;
+mod patch;
+mod proxy_options;
 mod reference;
 mod reflog;
 mod refspec;
@@ -462,6 +523,7 @@ mod revwalk;
 mod signature;
 mod status;
 mod submodule;
+mod stash;
 mod tag;
 mod time;
 mod tree;
@@ -469,17 +531,134 @@ mod treebuilder;
 
 fn init() {
     static INIT: Once = ONCE_INIT;
-    INIT.call_once(|| unsafe {
-        raw::openssl_init();
-        let r = raw::git_libgit2_init();
-        assert!(r >= 0,
-                "couldn't initialize the libgit2 library: {}", r);
-        assert_eq!(libc::atexit(shutdown), 0);
+
+    INIT.call_once(|| {
+        openssl_env_init();
     });
-    extern fn shutdown() {
-        unsafe { raw::git_libgit2_shutdown(); }
-    }
+
+    raw::init();
 }
+
+#[cfg(all(unix, not(target_os = "macos"), not(target_os = "ios"), feature = "https"))]
+fn openssl_env_init() {
+    extern crate openssl_probe;
+
+    // Currently, libgit2 leverages OpenSSL for SSL support when cloning
+    // repositories over HTTPS. This means that we're picking up an OpenSSL
+    // dependency on non-Windows platforms (where it has its own HTTPS
+    // subsystem). As a result, we need to link to OpenSSL.
+    //
+    // Now actually *linking* to OpenSSL isn't so hard. We just need to make
+    // sure to use pkg-config to discover any relevant system dependencies for
+    // differences between distributions like CentOS and Ubuntu. The actual
+    // trickiness comes about when we start *distributing* the resulting
+    // binaries. Currently Cargo is distributed in binary form as nightlies,
+    // which means we're distributing a binary with OpenSSL linked in.
+    //
+    // For historical reasons, the Linux nightly builder is running a CentOS
+    // distribution in order to have as much ABI compatibility with other
+    // distributions as possible. Sadly, however, this compatibility does not
+    // extend to OpenSSL. Currently OpenSSL has two major versions, 0.9 and 1.0,
+    // which are incompatible (many ABI differences). The CentOS builder we
+    // build on has version 1.0, as do most distributions today. Some still have
+    // 0.9, however. This means that if we are to distribute the binaries built
+    // by the CentOS machine, we would only be compatible with OpenSSL 1.0 and
+    // we would fail to run (a dynamic linker error at runtime) on systems with
+    // only 9.8 installed (hopefully).
+    //
+    // But wait, the plot thickens! Apparently CentOS has dubbed their OpenSSL
+    // library as `libssl.so.10`, notably the `10` is included at the end. On
+    // the other hand Ubuntu, for example, only distributes `libssl.so`. This
+    // means that the binaries created at CentOS are hard-wired to probe for a
+    // file called `libssl.so.10` at runtime (using the LD_LIBRARY_PATH), which
+    // will not be found on ubuntu. The conclusion of this is that binaries
+    // built on CentOS cannot be distributed to Ubuntu and run successfully.
+    //
+    // There are a number of sneaky things we could do, including, but not
+    // limited to:
+    //
+    // 1. Create a shim program which runs "just before" cargo runs. The
+    //    responsibility of this shim program would be to locate `libssl.so`,
+    //    whatever it's called, on the current system, make sure there's a
+    //    symlink *somewhere* called `libssl.so.10`, and then set up
+    //    LD_LIBRARY_PATH and run the actual cargo.
+    //
+    //    This approach definitely seems unconventional, and is borderline
+    //    overkill for this problem. It's also dubious if we can find a
+    //    libssl.so reliably on the target system.
+    //
+    // 2. Somehow re-work the CentOS installation so that the linked-against
+    //    library is called libssl.so instead of libssl.so.10
+    //
+    //    The problem with this approach is that systems with 0.9 installed will
+    //    start to silently fail, due to also having libraries called libssl.so
+    //    (probably symlinked under a more appropriate version).
+    //
+    // 3. Compile Cargo against both OpenSSL 1.0 *and* OpenSSL 0.9, and
+    //    distribute both. Also make sure that the linked-against name of the
+    //    library is `libssl.so`. At runtime we determine which version is
+    //    installed, and we then the appropriate binary.
+    //
+    //    This approach clearly has drawbacks in terms of infrastructure and
+    //    feasibility.
+    //
+    // 4. Build a nightly of Cargo for each distribution we'd like to support.
+    //    You would then pick the appropriate Cargo nightly to install locally.
+    //
+    // So, with all this in mind, the decision was made to *statically* link
+    // OpenSSL. This solves any problem of relying on a downstream OpenSSL
+    // version being available. This does, however, open a can of worms related
+    // to security issues. It's generally a good idea to dynamically link
+    // OpenSSL as you'll get security updates over time without having to do
+    // anything (the system administrator will update the local openssl
+    // package). By statically linking, we're forfeiting this feature.
+    //
+    // The conclusion was made it is likely appropriate for the Cargo nightlies
+    // to statically link OpenSSL, but highly encourage distributions and
+    // packagers of Cargo to dynamically link OpenSSL. Packagers are targeting
+    // one system and are distributing to only that system, so none of the
+    // problems mentioned above would arise.
+    //
+    // In order to support this, a new package was made: openssl-static-sys.
+    // This package currently performs a fairly simple task:
+    //
+    // 1. Run pkg-config to discover where openssl is installed.
+    // 2. If openssl is installed in a nonstandard location, *and* static copies
+    //    of the libraries are available, copy them to $OUT_DIR.
+    //
+    // This library will bring in libssl.a and libcrypto.a into the local build,
+    // allowing them to be picked up by this crate. This allows us to configure
+    // our own buildbots to have pkg-config point to these local pre-built
+    // copies of a static OpenSSL (with very few dependencies) while allowing
+    // most other builds of Cargo to naturally dynamically link OpenSSL.
+    //
+    // So in summary, if you're with me so far, we've statically linked OpenSSL
+    // to the Cargo binary (or any binary, for that matter) and we're ready to
+    // distribute it to *all* linux distributions. Remember that our original
+    // intent for openssl was for HTTPS support, which implies that we need some
+    // for of CA certificate store to validate certificates. This is normally
+    // installed in a standard system location.
+    //
+    // Unfortunately, as one might imagine, OpenSSL is configured for where this
+    // standard location is at *build time*, but it often varies widely
+    // per-system. Consequently, it was discovered that OpenSSL will respect the
+    // SSL_CERT_FILE and SSL_CERT_DIR environment variables in order to assist
+    // in discovering the location of this file (hurray!).
+    //
+    // So, finally getting to the point, this function solely exists to support
+    // our static builds of OpenSSL by probing for the "standard system
+    // location" of certificates and setting relevant environment variable to
+    // point to them.
+    //
+    // Ah, and as a final note, this is only a problem on Linux, not on OS X. On
+    // OS X the OpenSSL binaries are stable enough that we can just rely on
+    // dynamic linkage (plus they have some weird modifications to OpenSSL which
+    // means we wouldn't want to link statically).
+    openssl_probe::init_ssl_cert_env_vars();
+}
+
+#[cfg(any(windows, target_os = "macos", target_os = "ios", not(feature = "https")))]
+fn openssl_env_init() {}
 
 unsafe fn opt_bytes<'a, T>(_anchor: &'a T,
                            c: *const libc::c_char) -> Option<&'a [u8]> {
@@ -567,7 +746,7 @@ bitflags! {
     /// represents the status of file in the index relative to the HEAD, and the
     /// `STATUS_WT_*` set of flags represent the status of the file in the
     /// working directory relative to the index.
-    flags Status: u32 {
+    pub flags Status: u32 {
         #[allow(missing_docs)]
         const STATUS_CURRENT = raw::GIT_STATUS_CURRENT as u32,
 
@@ -601,10 +780,8 @@ bitflags! {
 }
 
 bitflags! {
-    #[doc = "
-Mode options for RepositoryInitOptions
-"]
-    flags RepositoryInitMode: u32 {
+    /// Mode options for RepositoryInitOptions
+    pub flags RepositoryInitMode: u32 {
         /// Use permissions configured by umask - the default
         const REPOSITORY_INIT_SHARED_UMASK =
                     raw::GIT_REPOSITORY_INIT_SHARED_UMASK as u32,
@@ -619,7 +796,7 @@ Mode options for RepositoryInitOptions
 }
 
 /// What type of change is described by a `DiffDelta`?
-#[derive(Copy, Clone, Debug)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum Delta {
     /// No changes
     Unmodified,
@@ -646,49 +823,47 @@ pub enum Delta {
 }
 
 bitflags! {
-    #[doc = r#"
-Return codes for submodule status.
-
-A combination of these flags will be returned to describe the status of a
-submodule.  Depending on the "ignore" property of the submodule, some of
-the flags may never be returned because they indicate changes that are
-supposed to be ignored.
-
-Submodule info is contained in 4 places: the HEAD tree, the index, config
-files (both .git/config and .gitmodules), and the working directory.  Any
-or all of those places might be missing information about the submodule
-depending on what state the repo is in.  We consider all four places to
-build the combination of status flags.
-
-There are four values that are not really status, but give basic info
-about what sources of submodule data are available.  These will be
-returned even if ignore is set to "ALL".
-
-* IN_HEAD   - superproject head contains submodule
-* IN_INDEX  - superproject index contains submodule
-* IN_CONFIG - superproject gitmodules has submodule
-* IN_WD     - superproject workdir has submodule
-
-The following values will be returned so long as ignore is not "ALL".
-
-* INDEX_ADDED       - in index, not in head
-* INDEX_DELETED     - in head, not in index
-* INDEX_MODIFIED    - index and head don't match
-* WD_UNINITIALIZED  - workdir contains empty directory
-* WD_ADDED          - in workdir, not index
-* WD_DELETED        - in index, not workdir
-* WD_MODIFIED       - index and workdir head don't match
-
-The following can only be returned if ignore is "NONE" or "UNTRACKED".
-
-* WD_INDEX_MODIFIED - submodule workdir index is dirty
-* WD_WD_MODIFIED    - submodule workdir has modified files
-
-Lastly, the following will only be returned for ignore "NONE".
-
-* WD_UNTRACKED      - wd contains untracked files
-"#]
-    flags SubmoduleStatus: u32 {
+    /// Return codes for submodule status.
+    ///
+    /// A combination of these flags will be returned to describe the status of a
+    /// submodule.  Depending on the "ignore" property of the submodule, some of
+    /// the flags may never be returned because they indicate changes that are
+    /// supposed to be ignored.
+    ///
+    /// Submodule info is contained in 4 places: the HEAD tree, the index, config
+    /// files (both .git/config and .gitmodules), and the working directory.  Any
+    /// or all of those places might be missing information about the submodule
+    /// depending on what state the repo is in.  We consider all four places to
+    /// build the combination of status flags.
+    ///
+    /// There are four values that are not really status, but give basic info
+    /// about what sources of submodule data are available.  These will be
+    /// returned even if ignore is set to "ALL".
+    ///
+    /// * IN_HEAD   - superproject head contains submodule
+    /// * IN_INDEX  - superproject index contains submodule
+    /// * IN_CONFIG - superproject gitmodules has submodule
+    /// * IN_WD     - superproject workdir has submodule
+    ///
+    /// The following values will be returned so long as ignore is not "ALL".
+    ///
+    /// * INDEX_ADDED       - in index, not in head
+    /// * INDEX_DELETED     - in head, not in index
+    /// * INDEX_MODIFIED    - index and head don't match
+    /// * WD_UNINITIALIZED  - workdir contains empty directory
+    /// * WD_ADDED          - in workdir, not index
+    /// * WD_DELETED        - in index, not workdir
+    /// * WD_MODIFIED       - index and workdir head don't match
+    ///
+    /// The following can only be returned if ignore is "NONE" or "UNTRACKED".
+    ///
+    /// * WD_INDEX_MODIFIED - submodule workdir index is dirty
+    /// * WD_WD_MODIFIED    - submodule workdir has modified files
+    ///
+    /// Lastly, the following will only be returned for ignore "NONE".
+    ///
+    /// * WD_UNTRACKED      - wd contains untracked files
+    pub flags SubmoduleStatus: u32 {
         #[allow(missing_docs)]
         const SUBMODULE_STATUS_IN_HEAD =
                 raw::GIT_SUBMODULE_STATUS_IN_HEAD as u32,
@@ -755,7 +930,7 @@ pub enum SubmoduleIgnore {
 
 bitflags! {
     /// ...
-    flags PathspecFlags: u32 {
+    pub flags PathspecFlags: u32 {
         /// Use the default pathspec matching configuration.
         const PATHSPEC_DEFAULT = raw::GIT_PATHSPEC_DEFAULT as u32,
         /// Force matching to ignore case, otherwise matching will use native
@@ -782,6 +957,22 @@ bitflags! {
     }
 }
 
+bitflags! {
+    /// Types of notifications emitted from checkouts.
+    pub flags CheckoutNotificationType: u32 {
+        /// Notification about a conflict.
+        const CHECKOUT_NOTIFICATION_CONFLICT = raw::GIT_CHECKOUT_NOTIFY_CONFLICT as u32,
+        /// Notification about a dirty file.
+        const CHECKOUT_NOTIFICATION_DIRTY = raw::GIT_CHECKOUT_NOTIFY_DIRTY as u32,
+        /// Notification about an updated file.
+        const CHECKOUT_NOTIFICATION_UPDATED = raw::GIT_CHECKOUT_NOTIFY_UPDATED as u32,
+        /// Notification about an untracked file.
+        const CHECKOUT_NOTIFICATION_UNTRACKED = raw::GIT_CHECKOUT_NOTIFY_UNTRACKED as u32,
+        /// Notification about an ignored file.
+        const CHECKOUT_NOTIFICATION_IGNORED = raw::GIT_CHECKOUT_NOTIFY_IGNORED as u32,
+    }
+}
+
 /// Possible output formats for diff data
 #[derive(Copy, Clone)]
 pub enum DiffFormat {
@@ -799,7 +990,7 @@ pub enum DiffFormat {
 
 bitflags! {
     /// Formatting options for diff stats
-    flags DiffStatsFormat: raw::git_diff_stats_format_t {
+    pub flags DiffStatsFormat: raw::git_diff_stats_format_t {
         /// Don't generate any stats
         const DIFF_STATS_NONE = raw::GIT_DIFF_STATS_NONE,
         /// Equivalent of `--stat` in git
@@ -835,6 +1026,55 @@ pub enum FetchPrune {
     On,
     /// Force pruning off
     Off,
+}
+
+#[allow(missing_docs)]
+#[derive(Debug)]
+pub enum StashApplyProgress {
+    /// None
+    None,
+    /// Loading the stashed data from the object database
+    LoadingStash,
+    /// The stored index is being analyzed
+    AnalyzeIndex,
+    /// The modified files are being analyzed
+    AnalyzeModified,
+    /// The untracked and ignored files are being analyzed
+    AnalyzeUntracked,
+    /// The untracked files are being written to disk
+    CheckoutUntracked,
+    /// The modified files are being written to disk
+    CheckoutModified,
+    /// The stash was applied successfully
+    Done,
+}
+
+bitflags! {
+    #[allow(missing_docs)]
+    pub flags StashApplyFlags: u32 {
+        #[allow(missing_docs)]
+        const STASH_APPLY_DEFAULT = raw::GIT_STASH_APPLY_DEFAULT as u32,
+        /// Try to reinstate not only the working tree's changes,
+        /// but also the index's changes.
+        const STASH_APPLY_REINSTATE_INDEX = raw::GIT_STASH_APPLY_REINSTATE_INDEX as u32,
+    }
+}
+
+bitflags! {
+    #[allow(missing_docs)]
+    pub flags StashFlags: u32 {
+        #[allow(missing_docs)]
+        const STASH_DEFAULT = raw::GIT_STASH_DEFAULT as u32,
+        /// All changes already added to the index are left intact in
+        /// the working directory
+        const STASH_KEEP_INDEX = raw::GIT_STASH_KEEP_INDEX as u32,
+        /// All untracked files are also stashed and then cleaned up
+        /// from the working directory
+        const STASH_INCLUDE_UNTRACKED = raw::GIT_STASH_INCLUDE_UNTRACKED as u32,
+        /// All ignored files are also stashed and then cleaned up from
+        /// the working directory
+        const STASH_INCLUDE_IGNORED = raw::GIT_STASH_INCLUDE_IGNORED as u32,
+    }
 }
 
 #[cfg(test)]

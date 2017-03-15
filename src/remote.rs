@@ -6,7 +6,7 @@ use std::slice;
 use std::str;
 use libc;
 
-use {raw, Direction, Error, Refspec, Oid, FetchPrune};
+use {raw, Direction, Error, Refspec, Oid, FetchPrune, ProxyOptions};
 use {RemoteCallbacks, Progress, Repository, AutotagOption};
 use util::Binding;
 
@@ -37,6 +37,7 @@ pub struct RemoteHead<'remote> {
 /// Options which can be specified to various fetch operations.
 pub struct FetchOptions<'cb> {
     callbacks: Option<RemoteCallbacks<'cb>>,
+    proxy: Option<ProxyOptions<'cb>>,
     prune: FetchPrune,
     update_fetchhead: bool,
     download_tags: AutotagOption,
@@ -45,7 +46,15 @@ pub struct FetchOptions<'cb> {
 /// Options to control the behavior of a git push.
 pub struct PushOptions<'cb> {
     callbacks: Option<RemoteCallbacks<'cb>>,
+    proxy: Option<ProxyOptions<'cb>>,
     pb_parallelism: u32,
+}
+
+/// Holds callbacks for a connection to a `Remote`. Disconnects when dropped
+pub struct RemoteConnection<'repo, 'connection, 'cb> where 'repo: 'connection {
+    _callbacks: Box<RemoteCallbacks<'cb>>,
+    _proxy: ProxyOptions<'cb>,
+    remote: &'connection mut Remote<'repo>,
 }
 
 impl<'repo> Remote<'repo> {
@@ -101,9 +110,35 @@ impl<'repo> Remote<'repo> {
         unsafe {
             try_call!(raw::git_remote_connect(self.raw, dir,
                                               0 as *const _,
+                                              0 as *const _,
                                               0 as *const _));
         }
         Ok(())
+    }
+
+    /// Open a connection to a remote with callbacks and proxy settings
+    ///
+    /// Returns a `RemoteConnection` that will disconnect once dropped
+    pub fn connect_auth<'connection, 'cb>(&'connection mut self,
+                                          dir: Direction,
+                                          cb: Option<RemoteCallbacks<'cb>>,
+                                          proxy_options: Option<ProxyOptions<'cb>>)
+                    -> Result<RemoteConnection<'repo, 'connection, 'cb>, Error> {
+
+        let cb = Box::new(cb.unwrap_or_else(|| RemoteCallbacks::new()));
+        let proxy_options = proxy_options.unwrap_or_else(|| ProxyOptions::new());
+        unsafe {
+            try_call!(raw::git_remote_connect(self.raw, dir,
+                                              &cb.raw(),
+                                              &proxy_options.raw(),
+                                              0 as *const _));
+        }
+
+        Ok(RemoteConnection {
+            _callbacks: cb,
+            _proxy: proxy_options,
+            remote: self,
+        })
     }
 
     /// Check whether the remote is connected
@@ -190,6 +225,10 @@ impl<'repo> Remote<'repo> {
     ///
     /// Perform all the steps for a push. If no refspecs are passed then the
     /// configured refspecs will be used.
+    ///
+    /// Note that you'll likely want to use `RemoteCallbacks` and set
+    /// `push_update_reference` to test whether all the references were pushed
+    /// successfully.
     pub fn push(&mut self,
                 refspecs: &[&str],
                 opts: Option<&mut PushOptions>) -> Result<(), Error> {
@@ -304,6 +343,7 @@ impl<'cb> FetchOptions<'cb> {
     pub fn new() -> FetchOptions<'cb> {
         FetchOptions {
             callbacks: None,
+            proxy: None,
             prune: FetchPrune::Unspecified,
             update_fetchhead: true,
             download_tags: AutotagOption::Unspecified,
@@ -313,6 +353,12 @@ impl<'cb> FetchOptions<'cb> {
     /// Set the callbacks to use for the fetch operation.
     pub fn remote_callbacks(&mut self, cbs: RemoteCallbacks<'cb>) -> &mut Self {
         self.callbacks = Some(cbs);
+        self
+    }
+
+    /// Set the proxy options to use for the fetch operation.
+    pub fn proxy_options(&mut self, opts: ProxyOptions<'cb>) -> &mut Self {
+        self.proxy = Some(opts);
         self
     }
 
@@ -351,6 +397,8 @@ impl<'cb> Binding for FetchOptions<'cb> {
             version: 1,
             callbacks: self.callbacks.as_ref().map(|m| m.raw())
                            .unwrap_or_else(|| RemoteCallbacks::new().raw()),
+            proxy_opts: self.proxy.as_ref().map(|m| m.raw())
+                            .unwrap_or_else(|| ProxyOptions::new().raw()),
             prune: ::call::convert(&self.prune),
             update_fetchhead: ::call::convert(&self.update_fetchhead),
             download_tags: ::call::convert(&self.download_tags),
@@ -368,6 +416,7 @@ impl<'cb> PushOptions<'cb> {
     pub fn new() -> PushOptions<'cb> {
         PushOptions {
             callbacks: None,
+            proxy: None,
             pb_parallelism: 1,
         }
     }
@@ -375,6 +424,12 @@ impl<'cb> PushOptions<'cb> {
     /// Set the callbacks to use for the fetch operation.
     pub fn remote_callbacks(&mut self, cbs: RemoteCallbacks<'cb>) -> &mut Self {
         self.callbacks = Some(cbs);
+        self
+    }
+
+    /// Set the proxy options to use for the fetch operation.
+    pub fn proxy_options(&mut self, opts: ProxyOptions<'cb>) -> &mut Self {
+        self.proxy = Some(opts);
         self
     }
 
@@ -401,6 +456,8 @@ impl<'cb> Binding for PushOptions<'cb> {
             version: 1,
             callbacks: self.callbacks.as_ref().map(|m| m.raw())
                            .unwrap_or(RemoteCallbacks::new().raw()),
+            proxy_opts: self.proxy.as_ref().map(|m| m.raw())
+                            .unwrap_or_else(|| ProxyOptions::new().raw()),
             pb_parallelism: self.pb_parallelism as libc::c_uint,
             // TODO: expose this as a builder option
             custom_headers: raw::git_strarray {
@@ -411,12 +468,33 @@ impl<'cb> Binding for PushOptions<'cb> {
     }
 }
 
+impl<'repo, 'connection, 'cb> RemoteConnection<'repo, 'connection, 'cb> {
+    /// Check whether the remote is (still) connected
+    pub fn connected(&mut self) -> bool {
+        self.remote.connected()
+    }
+
+    /// Get the remote repository's reference advertisement list.
+    ///
+    /// This list is available as soon as the connection to
+    /// the remote is initiated and it remains available after disconnecting.
+    pub fn list(&self) -> Result<&[RemoteHead], Error> {
+        self.remote.list()
+    }
+}
+
+impl<'repo, 'connection, 'cb> Drop for RemoteConnection<'repo, 'connection, 'cb> {
+    fn drop(&mut self) {
+        self.remote.disconnect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::cell::Cell;
     use tempdir::TempDir;
     use {Repository, Remote, RemoteCallbacks, Direction, FetchOptions};
-    use {AutotagOption};
+    use {AutotagOption, PushOptions};
 
     #[test]
     fn smoke() {
@@ -483,6 +561,18 @@ mod tests {
         origin.download(&[], None).unwrap();
         origin.disconnect();
 
+        {
+            let mut connection = origin.connect_auth(Direction::Push, None, None).unwrap();
+            assert!(connection.connected());
+        }
+        assert!(!origin.connected());
+
+        {
+            let mut connection = origin.connect_auth(Direction::Fetch, None, None).unwrap();
+            assert!(connection.connected());
+        }
+        assert!(!origin.connected());
+
         origin.fetch(&[], None, None).unwrap();
         origin.fetch(&[], None, Some("foo")).unwrap();
         origin.update_tips(None, true, AutotagOption::Unspecified, None).unwrap();
@@ -546,6 +636,37 @@ mod tests {
         assert!(progress_hit.get());
     }
 
+    /// This test is meant to assure that the callbacks provided to connect will not cause
+    /// segfaults
+    #[test]
+    fn connect_list() {
+        let (td, _repo) = ::test::repo_init();
+        let td2 = TempDir::new("git").unwrap();
+        let url = ::test::path2url(&td.path());
+
+        let repo = Repository::init(td2.path()).unwrap();
+        let mut callbacks = RemoteCallbacks::new();
+        callbacks.sideband_progress(|_progress| {
+            // no-op
+            true
+        });
+
+        let mut origin = repo.remote("origin", &url).unwrap();
+
+        {
+            let mut connection = origin.connect_auth(Direction::Fetch, Some(callbacks), None).unwrap();
+            assert!(connection.connected());
+
+            let list = t!(connection.list());
+            assert_eq!(list.len(), 2);
+            assert_eq!(list[0].name(), "HEAD");
+            assert!(!list[0].is_local());
+            assert_eq!(list[1].name(), "refs/heads/master");
+            assert!(!list[1].is_local());
+        }
+        assert!(!origin.connected());
+    }
+
     #[test]
     fn push() {
         let (_td, repo) = ::test::repo_init();
@@ -556,7 +677,20 @@ mod tests {
         Repository::init_bare(td2.path()).unwrap();
         // git push
         let mut remote = repo.remote("origin", &url).unwrap();
-        remote.push(&["refs/heads/master"], None).unwrap();
+        let mut updated = false;
+        {
+            let mut callbacks = RemoteCallbacks::new();
+            callbacks.push_update_reference(|refname, status| {
+                updated = true;
+                assert_eq!(refname, "refs/heads/master");
+                assert_eq!(status, None);
+                Ok(())
+            });
+            let mut options = PushOptions::new();
+            options.remote_callbacks(callbacks);
+            remote.push(&["refs/heads/master"], Some(&mut options)).unwrap();
+        }
+        assert!(updated);
 
         let repo = Repository::clone(&url, td3.path()).unwrap();
         let commit = repo.head().unwrap().target().unwrap();

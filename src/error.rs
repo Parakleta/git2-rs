@@ -1,3 +1,4 @@
+use std::env::JoinPathsError;
 use std::ffi::{CStr, NulError};
 use std::error;
 use std::fmt;
@@ -7,7 +8,7 @@ use libc::c_int;
 use {raw, ErrorClass, ErrorCode};
 
 /// A structure to represent errors coming out of libgit2.
-#[derive(Debug)]
+#[derive(Debug,PartialEq)]
 pub struct Error {
     code: c_int,
     klass: c_int,
@@ -211,6 +212,12 @@ impl From<NulError> for Error {
     fn from(_: NulError) -> Error {
         Error::from_str("data contained a nul byte that could not be \
                          represented as a string")
+    }
+}
+
+impl From<JoinPathsError> for Error {
+    fn from(e: JoinPathsError) -> Error {
+        Error::from_str(error::Error::description(&e))
     }
 }
 

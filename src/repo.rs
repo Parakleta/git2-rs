@@ -1,18 +1,20 @@
-use std::ffi::{CStr, CString};
+use std::env;
+use std::ffi::{CStr, CString, OsStr};
 use std::iter::IntoIterator;
 use std::mem;
 use std::path::Path;
 use std::str;
 use libc::{c_int, c_char, size_t, c_void, c_uint};
 
-use {raw, Revspec, Error, init, Object, RepositoryState, Remote, Buf};
+use {raw, Revspec, Error, init, Object, RepositoryOpenFlags, RepositoryState, Remote, Buf, StashFlags};
 use {ResetType, Signature, Reference, References, Submodule, Blame, BlameOptions};
 use {Branches, BranchType, Index, Config, Oid, Blob, Branch, Commit, Tree};
 use {AnnotatedCommit, MergeOptions, SubmoduleIgnore, SubmoduleStatus};
 use {ObjectType, Tag, Note, Notes, StatusOptions, Statuses, Status, Revwalk};
 use {RevparseMode, RepositoryInitMode, Reflog, IntoCString, Describe};
-use {DescribeOptions, TreeBuilder, Diff, DiffOptions};
+use {DescribeOptions, TreeBuilder, Diff, DiffOptions, PackBuilder};
 use build::{RepoBuilder, CheckoutBuilder};
+use stash::{StashApplyOptions, StashCbData, stash_cb};
 use string_array::StringArray;
 use oid_array::OidArray;
 use util::{self, Binding};
@@ -55,6 +57,70 @@ impl Repository {
         let mut ret = 0 as *mut raw::git_repository;
         unsafe {
             try_call!(raw::git_repository_open(&mut ret, path));
+            Ok(Binding::from_raw(ret))
+        }
+    }
+
+    /// Find and open an existing repository, respecting git environment
+    /// variables.  This acts like `open_ext` with the
+    /// `REPOSITORY_OPEN_FROM_ENV` flag, but additionally respects `$GIT_DIR`.
+    /// With `$GIT_DIR` unset, this will search for a repository starting in
+    /// the current directory.
+    pub fn open_from_env() -> Result<Repository, Error> {
+        init();
+        let mut ret = 0 as *mut raw::git_repository;
+        let flags = raw::GIT_REPOSITORY_OPEN_FROM_ENV;
+        unsafe {
+            try_call!(raw::git_repository_open_ext(&mut ret,
+                                                   0 as *const _,
+                                                   flags as c_uint,
+                                                   0 as *const _));
+            Ok(Binding::from_raw(ret))
+        }
+    }
+
+    /// Find and open an existing repository, with additional options.
+    ///
+    /// If flags contains REPOSITORY_OPEN_NO_SEARCH, the path must point
+    /// directly to a repository; otherwise, this may point to a subdirectory
+    /// of a repository, and `open_ext` will search up through parent
+    /// directories.
+    ///
+    /// If flags contains REPOSITORY_OPEN_CROSS_FS, the search through parent
+    /// directories will not cross a filesystem boundary (detected when the
+    /// stat st_dev field changes).
+    ///
+    /// If flags contains REPOSITORY_OPEN_BARE, force opening the repository as
+    /// bare even if it isn't, ignoring any working directory, and defer
+    /// loading the repository configuration for performance.
+    ///
+    /// If flags contains REPOSITORY_OPEN_NO_DOTGIT, don't try appending
+    /// `/.git` to `path`.
+    ///
+    /// If flags contains REPOSITORY_OPEN_FROM_ENV, `open_ext` will ignore
+    /// other flags and `ceiling_dirs`, and respect the same environment
+    /// variables git does. Note, however, that `path` overrides `$GIT_DIR`; to
+    /// respect `$GIT_DIR` as well, use `open_from_env`.
+    ///
+    /// ceiling_dirs specifies a list of paths that the search through parent
+    /// directories will stop before entering.  Use the functions in std::env
+    /// to construct or manipulate such a path list.
+    pub fn open_ext<P, O, I>(path: P,
+                             flags: RepositoryOpenFlags,
+                             ceiling_dirs: I)
+                             -> Result<Repository, Error>
+            where P: AsRef<Path>, O: AsRef<OsStr>, I: IntoIterator<Item=O>
+    {
+        init();
+        let path = try!(path.as_ref().into_c_string());
+        let ceiling_dirs_os = try!(env::join_paths(ceiling_dirs));
+        let ceiling_dirs = try!(ceiling_dirs_os.into_c_string());
+        let mut ret = 0 as *mut raw::git_repository;
+        unsafe {
+            try_call!(raw::git_repository_open_ext(&mut ret,
+                                                   path,
+                                                   flags.bits() as c_uint,
+                                                   ceiling_dirs));
             Ok(Binding::from_raw(ret))
         }
     }
@@ -238,6 +304,21 @@ impl Repository {
         }
     }
 
+    /// Set the path to the working directory for this repository.
+    ///
+    /// If `update_link` is true, create/update the gitlink file in the workdir
+    /// and set config "core.worktree" (if workdir is not the parent of the .git
+    /// directory).
+    pub fn set_workdir(&self, path: &Path, update_gitlink: bool)
+                       -> Result<(), Error> {
+        let path = try!(path.into_c_string());
+        unsafe {
+            try_call!(raw::git_repository_set_workdir(self.raw(), path,
+                                                      update_gitlink));
+        }
+        Ok(())
+    }
+
     /// Get the currently active namespace for this repository.
     ///
     /// If there is no namespace, or the namespace is not a valid utf8 string,
@@ -409,7 +490,7 @@ impl Repository {
     /// will be left alone, however.)
     ///
     /// The `target` is a commit-ish to which the head should be moved to. The
-    /// object can either be a commit or a tag, but tags must be derefernceable
+    /// object can either be a commit or a tag, but tags must be dereferenceable
     /// to a commit.
     ///
     /// The `checkout` options will only be used for a hard reset.
@@ -637,6 +718,13 @@ impl Repository {
         }
     }
 
+    /// Set the Index file for this repository.
+    pub fn set_index(&self, index: &mut Index) {
+        unsafe {
+            raw::git_repository_set_index(self.raw(), index.raw());
+        }
+    }
+
     /// Get the configuration file for this repository.
     ///
     /// If a configuration file has not been set, the default config set for the
@@ -797,6 +885,57 @@ impl Repository {
         }
     }
 
+    /// Conditionally create new direct reference.
+    ///
+    /// A direct reference (also called an object id reference) refers directly
+    /// to a specific object id (a.k.a. OID or SHA) in the repository.  The id
+    /// permanently refers to the object (although the reference itself can be
+    /// moved).  For example, in libgit2 the direct ref "refs/tags/v0.17.0"
+    /// refers to OID 5b9fac39d8a76b9139667c26a63e6b3f204b3977.
+    ///
+    /// The direct reference will be created in the repository and written to
+    /// the disk.
+    ///
+    /// Valid reference names must follow one of two patterns:
+    ///
+    /// 1. Top-level names must contain only capital letters and underscores,
+    ///    and must begin and end with a letter.  (e.g.  "HEAD", "ORIG_HEAD").
+    /// 2. Names prefixed with "refs/" can be almost anything.  You must avoid
+    ///    the characters `~`, `^`, `:`, `\\`, `?`, `[`, and `*`, and the
+    ///    sequences ".." and "@{" which have special meaning to revparse.
+    ///
+    /// This function will return an error if a reference already exists with
+    /// the given name unless `force` is true, in which case it will be
+    /// overwritten.
+    ///
+    /// The message for the reflog will be ignored if the reference does not
+    /// belong in the standard set (HEAD, branches and remote-tracking
+    /// branches) and it does not have a reflog.
+    ///
+    /// It will return GIT_EMODIFIED if the reference's value at the time of
+    /// updating does not match the one passed through `current_id` (i.e. if the
+    /// ref has changed since the user read it).
+    pub fn reference_matching(&self,
+                              name: &str,
+                              id: Oid,
+                              force: bool,
+                              current_id: Oid,
+                              log_message: &str) -> Result<Reference, Error> {
+        let name = try!(CString::new(name));
+        let log_message = try!(CString::new(log_message));
+        let mut raw = 0 as *mut raw::git_reference;
+        unsafe {
+            try_call!(raw::git_reference_create_matching(&mut raw,
+                                                         self.raw(),
+                                                         name,
+                                                         id.raw(),
+                                                         force,
+                                                         current_id.raw(),
+                                                         log_message));
+            Ok(Binding::from_raw(raw))
+        }
+    }
+
     /// Create a new symbolic reference.
     ///
     /// This function will return an error if a reference already exists with
@@ -814,6 +953,39 @@ impl Repository {
             try_call!(raw::git_reference_symbolic_create(&mut raw, self.raw(),
                                                          name, target, force,
                                                          log_message));
+            Ok(Binding::from_raw(raw))
+        }
+    }
+
+    /// Create a new symbolic reference.
+    ///
+    /// This function will return an error if a reference already exists with
+    /// the given name unless force is true, in which case it will be
+    /// overwritten.
+    ///
+    /// It will return GIT_EMODIFIED if the reference's value at the time of
+    /// updating does not match the one passed through current_value (i.e. if
+    /// the ref has changed since the user read it).
+    pub fn reference_symbolic_matching(&self,
+                                       name: &str,
+                                       target: &str,
+                                       force: bool,
+                                       current_value: &str,
+                                       log_message: &str)
+                                       -> Result<Reference, Error> {
+        let name = try!(CString::new(name));
+        let target = try!(CString::new(target));
+        let current_value = try!(CString::new(current_value));
+        let log_message = try!(CString::new(log_message));
+        let mut raw = 0 as *mut raw::git_reference;
+        unsafe {
+            try_call!(raw::git_reference_symbolic_create_matching(&mut raw,
+                                                                  self.raw(),
+                                                                  name,
+                                                                  target,
+                                                                  force,
+                                                                  current_value,
+                                                                  log_message));
             Ok(Binding::from_raw(raw))
         }
     }
@@ -1351,6 +1523,24 @@ impl Repository {
         Ok(())
     }
 
+    /// Check if the given reference has a reflog.
+    pub fn reference_has_log(&self, name: &str) -> Result<bool, Error> {
+        let name = try!(CString::new(name));
+        let ret = unsafe {
+            try_call!(raw::git_reference_has_log(self.raw, name))
+        };
+        Ok(ret != 0)
+    }
+
+    /// Ensure that the given reference has a reflog.
+    pub fn reference_ensure_log(&self, name: &str) -> Result<(), Error> {
+        let name = try!(CString::new(name));
+        unsafe {
+            try_call!(raw::git_reference_ensure_log(self.raw, name));
+        }
+        Ok(())
+    }
+
     /// Describes a commit
     ///
     /// Performs a describe operation on the current commit and the worktree.
@@ -1413,6 +1603,26 @@ impl Repository {
                                                   old_tree.map(|s| s.raw()),
                                                   index.map(|s| s.raw()),
                                                   opts.map(|s| s.raw())));
+            Ok(Binding::from_raw(ret))
+        }
+    }
+
+    /// Create a diff between two index objects.
+    ///
+    /// The first index will be used for the "old_file" side of the delta, and
+    /// the second index will be used for the "new_file" side of the delta.
+    pub fn diff_index_to_index(&self,
+                               old_index: &Index,
+                               new_index: &Index,
+                               opts: Option<&mut DiffOptions>)
+                               -> Result<Diff, Error> {
+        let mut ret = 0 as *mut raw::git_diff;
+        unsafe {
+            try_call!(raw::git_diff_index_to_index(&mut ret,
+                                                   self.raw(),
+                                                   old_index.raw(),
+                                                   new_index.raw(),
+                                                   opts.map(|s| s.raw())));
             Ok(Binding::from_raw(ret))
         }
     }
@@ -1491,6 +1701,81 @@ impl Repository {
             try_call!(raw::git_diff_tree_to_workdir_with_index(&mut ret,
                     self.raw(), old_tree.map(|s| s.raw()), opts.map(|s| s.raw())));
             Ok(Binding::from_raw(ret))
+        }
+    }
+
+    /// Create a PackBuilder
+    pub fn packbuilder(&self) -> Result<PackBuilder, Error> {
+        let mut ret = 0 as *mut raw::git_packbuilder;
+        unsafe {
+            try_call!(raw::git_packbuilder_new(&mut ret, self.raw()));
+            Ok(Binding::from_raw(ret))
+        }
+    }
+
+    /// Save the local modifications to a new stash.
+    pub fn stash_save(&mut self,
+                      stasher: &Signature,
+                      message: &str,
+                      flags: Option<StashFlags>)
+                      -> Result<Oid, Error> {
+        unsafe {
+            let mut raw_oid = raw::git_oid { id: [0; raw::GIT_OID_RAWSZ] };
+            let message = try!(CString::new(message));
+            let flags = flags.unwrap_or(StashFlags::empty());
+            try_call!(raw::git_stash_save(&mut raw_oid,
+                                          self.raw(),
+                                          stasher.raw(),
+                                          message,
+                                          flags.bits() as c_uint));
+            Ok(Binding::from_raw(&raw_oid as *const _))
+        }
+    }
+
+    /// Apply a single stashed state from the stash list.
+    pub fn stash_apply(&mut self,
+                       index: usize,
+                       opts: Option<&mut StashApplyOptions>)
+                       -> Result<(), Error> {
+        unsafe {
+            let opts = opts.map(|opts| opts.raw());
+            try_call!(raw::git_stash_apply(self.raw(), index, opts));
+            Ok(())
+        }
+    }
+
+    /// Loop over all the stashed states and issue a callback for each one.
+    ///
+    /// Return `true` to continue iterating or `false` to stop.
+    pub fn stash_foreach<C>(&mut self, mut callback: C) -> Result<(), Error>
+        where C: FnMut(usize, &str, &Oid) -> bool
+    {
+        unsafe {
+            let mut data = StashCbData { callback: &mut callback };
+            try_call!(raw::git_stash_foreach(self.raw(),
+                                             stash_cb,
+                                             &mut data as *mut _ as *mut _));
+            Ok(())
+        }
+    }
+
+    /// Remove a single stashed state from the stash list.
+    pub fn stash_drop(&mut self, index: usize) -> Result<(), Error> {
+        unsafe {
+            try_call!(raw::git_stash_drop(self.raw(), index));
+            Ok(())
+        }
+    }
+
+    /// Apply a single stashed state from the stash list and remove it from the list if successful.
+    pub fn stash_pop(&mut self,
+                     index: usize,
+                     opts: Option<&mut StashApplyOptions>)
+                     -> Result<(), Error> {
+        unsafe {
+            let opts = opts.map(|opts| opts.raw());
+            try_call!(raw::git_stash_pop(self.raw(), index, opts));
+            Ok(())
         }
     }
 }
@@ -1663,6 +1948,7 @@ impl RepositoryInitOptions {
 
 #[cfg(test)]
 mod tests {
+    use std::ffi::OsStr;
     use std::fs;
     use std::path::Path;
     use tempdir::TempDir;
@@ -1754,6 +2040,31 @@ mod tests {
                    ::test::realpath(&td.path().join("")).unwrap());
     }
 
+    #[test]
+    fn smoke_open_ext() {
+        let td = TempDir::new("test").unwrap();
+        let subdir = td.path().join("subdir");
+        fs::create_dir(&subdir).unwrap();
+        Repository::init(td.path()).unwrap();
+
+        let repo = Repository::open_ext(&subdir, ::RepositoryOpenFlags::empty(), &[] as &[&OsStr]).unwrap();
+        assert!(!repo.is_bare());
+        assert_eq!(::test::realpath(&repo.path()).unwrap(),
+                   ::test::realpath(&td.path().join(".git")).unwrap());
+
+        let repo = Repository::open_ext(&subdir, ::REPOSITORY_OPEN_BARE, &[] as &[&OsStr]).unwrap();
+        assert!(repo.is_bare());
+        assert_eq!(::test::realpath(&repo.path()).unwrap(),
+                   ::test::realpath(&td.path().join(".git")).unwrap());
+
+        let err = Repository::open_ext(&subdir, ::REPOSITORY_OPEN_NO_SEARCH, &[] as &[&OsStr]).err().unwrap();
+        assert_eq!(err.code(), ::ErrorCode::NotFound);
+
+        assert!(Repository::open_ext(&subdir,
+                                     ::RepositoryOpenFlags::empty(),
+                                     &[&subdir]).is_ok());
+    }
+
     fn graph_repo_init() -> (TempDir, Repository) {
         let (_td, repo) = ::test::repo_init();
         {
@@ -1797,6 +2108,20 @@ mod tests {
         let head_parent_id = head.parent(0).unwrap().id();
         assert!(repo.graph_descendant_of(head_id, head_parent_id).unwrap());
         assert!(!repo.graph_descendant_of(head_parent_id, head_id).unwrap());
+    }
+
+    #[test]
+    fn smoke_reference_has_log_ensure_log() {
+        let (_td, repo) = ::test::repo_init();
+
+        assert_eq!(repo.reference_has_log("HEAD").unwrap(), true);
+        assert_eq!(repo.reference_has_log("refs/heads/master").unwrap(), true);
+        assert_eq!(repo.reference_has_log("NOT_HEAD").unwrap(), false);
+        let master_oid = repo.revparse_single("master").unwrap().id();
+        assert!(repo.reference("NOT_HEAD", master_oid, false, "creating a new branch").is_ok());
+        assert_eq!(repo.reference_has_log("NOT_HEAD").unwrap(), false);
+        assert!(repo.reference_ensure_log("NOT_HEAD").is_ok());
+        assert_eq!(repo.reference_has_log("NOT_HEAD").unwrap(), true);
     }
 
     #[test]
@@ -1855,6 +2180,8 @@ mod tests {
         let commit2 = repo.find_commit(oid2).unwrap();
         println!("created oid2 {:?}", oid2);
 
+        t!(repo.reset(commit1.as_object(), ResetType::Hard, None));
+
         // create commit oid3 on branchB
         let mut index = repo.index().unwrap();
         let p = Path::new(repo.workdir().unwrap()).join("file_b");
@@ -1903,7 +2230,7 @@ mod tests {
         }
         assert!(found_oid2);
         assert!(found_oid3);
-	assert_eq!(merge_bases.len(), 2);
+	    assert_eq!(merge_bases.len(), 2);
     }
 
     #[test]

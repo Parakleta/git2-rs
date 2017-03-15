@@ -3,7 +3,7 @@ use std::io::Write;
 use std::mem;
 use std::path::Path;
 use std::process::{Command, Stdio};
-use url::{self, UrlParser};
+use url;
 
 use {raw, Error, Config, IntoCString};
 use util::Binding;
@@ -168,26 +168,13 @@ impl CredentialHelper {
         };
 
         // Parse out the (protocol, host) if one is available
-        let parsed_url = UrlParser::new().scheme_type_mapper(mapper).parse(url);
-        match parsed_url {
-            Ok(url) => {
-                match url.host() {
-                    Some(&url::Host::Domain(ref s)) => ret.host = Some(s.clone()),
-                    _ => {}
-                }
-                ret.protocol = Some(url.scheme)
+        if let Ok(url) = url::Url::parse(url) {
+            if let Some(url::Host::Domain(s)) = url.host() {
+                ret.host = Some(s.to_string());
             }
-            Err(..) => {}
-        };
-        return ret;
-
-        fn mapper(s: &str) -> url::SchemeType {
-            match s {
-                "git" => url::SchemeType::Relative(9418),
-                "ssh" => url::SchemeType::Relative(22),
-                s => url::whatwg_scheme_type_mapper(s),
-            }
+            ret.protocol = Some(url.scheme().to_string())
         }
+        return ret;
     }
 
     /// Set the username that this credential helper will query with.
@@ -245,7 +232,11 @@ impl CredentialHelper {
     // see https://www.kernel.org/pub/software/scm/git/docs/technical
     //                           /api-credentials.html#_credential_helpers
     fn add_command(&mut self, cmd: Option<&str>) {
-        let cmd = match cmd { Some(s) => s, None => return };
+        let cmd = match cmd {
+            Some("") | None => return,
+            Some(s) => s,
+        };
+
         if cmd.starts_with("!") {
             self.commands.push(cmd[1..].to_string());
         } else if cmd.starts_with("/") || cmd.starts_with("\\") ||
@@ -454,6 +445,16 @@ echo username=c
                                       .execute().unwrap();
         assert_eq!(u, "c");
         assert_eq!(p, "b");
+    }
+
+    #[test]
+    fn credential_helper6() {
+        let cfg = cfg! {
+            "credential.helper" => ""
+        };
+        assert!(CredentialHelper::new("https://example.com/foo/bar")
+                .config(&cfg)
+                .execute().is_none());
     }
 
     #[cfg(unix)]
